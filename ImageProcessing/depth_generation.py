@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Depth + Colored Point Cloud from a side-by-side stereo image (NO RESIZING).
+
+- Reads SBS image (e.g., 3840x1080), splits into two 1920x1080 halves.
+- Verifies halves match calibration size from NPZ (image_size).
+- Rectifies, computes disparity (SGBM, optional WLS), and exports:
+    - rectified images (PNG)
+    - disparity (u8 PNG + color PNG + float32 NPY)
+    - depth from Q (mm) as NPY + 16-bit PNG
+    - depth from fx*B/d (meters) as NPY
+    - Q, P1, P2 as NPY
+    - colored point cloud PLY (meters) reprojected with Q (left colors)
+
+Notes:
+- Units: reprojected 3D points via Q inherit the units of T in calibration (yours look like mm).
+- The PLY is exported in meters for sanity (mm → m if CALIB_T_UNIT == "mm").
+"""
+
+import os
+from typing import Tuple, Dict, List, Optional
+import numpy as np
+import cv2
+import open3d as o3d
+
+# ========== EDIT THESE ==========
+IMAGE_PATH = r"data/input_images/WIN_20250910_11_10_35_Pro.jpg"  # SBS image
+CALIB_NPZ  = r"opencv_stereo_params2.npz"                        # your npz
+OUTPUT_DIR = r"data/output/depth_only"
+USE_WLS    = True                                                # needs opencv-contrib (cv2.ximgproc)
+
+# Set to "mm" if your T is in millimeters; "m" if meters.
+CALIB_T_UNIT = "mm"
+
+# PLY export Z gate (same units as CALIB_T_UNIT here, converted to meters internally if "mm")
+PLY_Z_MIN = 50.0     # e.g., 50 mm or 0.05 m
+PLY_Z_MAX = 5000.0   # e.g., 5000 mm or 5.0 m
+# ===============================
+
+
+# ---------- Calibration / Rectification ----------
+
+def load_npz_calibration(npz_path: str) -> Dict[str, np.ndarray | tuple]:
+    """Load stereo calibration parameters from NPZ."""
+    if not os.path.exists(npz_path):
+        raise FileNotFoundError(npz_path)
+    p = np.load(npz_path, allow_pickle=False)
+
+    K1 = np.array(p["camera_matrix_1"])
+    D1 = np.array(p["dist_coeffs_1"]).reshape(-1, 1)
+    K2 = np.array(p["camera_matrix_2"])
+    D2 = np.array(p["dist_coeffs_2"]).reshape(-1, 1)
+    R  = np.array(p["R"])
+    T  = np.array(p["T"]).reshape(3, 1)
+
+    # image_size is typically [H, W] or [W, H]; make it (W, H)
+    image_size = tuple(np.array(p["image_size"]).tolist())
+    if image_size[0] < image_size[1]:
+        W, H = image_size[1], image_size[0]
+    else:
+        W, H = image_size  # already (W, H)
+
+    return dict(K1=K1, D1=D1, K2=K2, D2=D2, R=R, T=T, size=(W, H))
+
+
+def split_sbs(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Split an SBS image into left/right halves (no resize)."""
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read: {path}")
+    h, w = img.shape[:2]
+    if w % 2 != 0:
+        raise ValueError(f"Width must be even for SBS. Got {w}")
+    half = w // 2
+    return img[:, :half].copy(), img[:, half:].copy()
+
+
+def rectify_no_resize(left_bgr: np.ndarray, right_bgr: np.ndarray, calib: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Rectify with NO resizing. Validates (W,H) of halves match calibration size.
+    """
+    Wc, Hc = calib["size"]
+    Hl, Wl = left_bgr.shape[:2]
+    Hr, Wr = right_bgr.shape[:2]
+
+    if (Wl, Hl) != (Wc, Hc) or (Wr, Hr) != (Wc, Hc):
+        raise ValueError(
+            f"Input halves size mismatch with calibration.\n"
+            f"  Left:  {(Wl, Hl)}\n"
+            f"  Right: {(Wr, Hr)}\n"
+            f"  Calib: {(Wc, Hc)}\n"
+            f"Ensure your SBS halves equal the calibration size (e.g., 1920x1080)."
+        )
+
+    # Compute rectification transforms and projection matrices
+    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
+        calib["K1"], calib["D1"], calib["K2"], calib["D2"],
+        (Wc, Hc), calib["R"], calib["T"],
+        flags=cv2.CALIB_ZERO_DISPARITY, alpha=0
+    )
+
+    map1L, map2L = cv2.initUndistortRectifyMap(calib["K1"], calib["D1"], R1, P1, (Wc, Hc), cv2.CV_16SC2)
+    map1R, map2R = cv2.initUndistortRectifyMap(calib["K2"], calib["D2"], R2, P2, (Wc, Hc), cv2.CV_16SC2)
+
+    rectL = cv2.remap(left_bgr,  map1L, map2L, cv2.INTER_LINEAR)
+    rectR = cv2.remap(right_bgr, map1R, map2R, cv2.INTER_LINEAR)
+    return rectL, rectR, P1, P2, Q
+
+
+# ---------- Disparity / Depth ----------
+
+def compute_disparity(rectL_bgr: np.ndarray,
+                      rectR_bgr: np.ndarray,
+                      num_disp: int = 240,
+                      block_size: int = 3,
+                      use_wls: bool = True) -> np.ndarray:
+    """Compute disparity (SGBM, optional WLS)."""
+    grayL = cv2.cvtColor(rectL_bgr, cv2.COLOR_BGR2GRAY)
+    grayR = cv2.cvtColor(rectR_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Light denoise + local contrast improve (helps SGBM)
+    grayL = cv2.bilateralFilter(grayL, 9, 50, 50)
+    grayR = cv2.bilateralFilter(grayR, 9, 50, 50)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    grayL = clahe.apply(grayL); grayR = clahe.apply(grayR)
+
+    nd = int(np.ceil(num_disp / 16.0)) * 16
+    bs = block_size if block_size % 2 == 1 else block_size + 1
+
+    sgbm = cv2.StereoSGBM_create(
+        minDisparity=0,
+        numDisparities=nd,
+        blockSize=bs,
+        P1=8 * bs * bs,
+        P2=32 * bs * bs,
+        disp12MaxDiff=1,
+        uniquenessRatio=20,
+        speckleWindowSize=10,
+        speckleRange=16,
+        preFilterCap=31,
+        mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
+    )
+    dispL16 = sgbm.compute(grayL, grayR)
+
+    if use_wls and hasattr(cv2, "ximgproc"):
+        right_matcher = cv2.ximgproc.createRightMatcher(sgbm)
+        dispR16 = right_matcher.compute(grayR, grayL)
+        wls = cv2.ximgproc.createDisparityWLSFilter(matcher_left=sgbm)
+        wls.setLambda(15000.0)
+        wls.setSigmaColor(1.2)
+        disp = wls.filter(dispL16, rectL_bgr, disparity_map_right=dispR16).astype(np.float32) / 16.0
+    else:
+        disp = dispL16.astype(np.float32) / 16.0
+
+    # Additional speckle cleanup
+    d16 = (disp * 16.0).astype(np.int16)
+    cv2.filterSpeckles(d16, 0, 0, 2 * 16)
+    disp = d16.astype(np.float32) / 16.0
+    disp[disp < 0] = 0.0
+    return disp
+
+
+def disparity_to_depth_Q(disp: np.ndarray, Q: np.ndarray) -> np.ndarray:
+    """Depth via Q; Z in same units as T in calibration (likely mm)."""
+    pts3d = cv2.reprojectImageTo3D(disp.astype(np.float32), Q)  # (H,W,3)
+    Z = pts3d[..., 2].astype(np.float32)
+    Z[~np.isfinite(Z)] = 0.0
+    Z[disp <= 0] = 0.0
+    return Z
+
+
+def disparity_to_depth_fxB(disp: np.ndarray, P1: np.ndarray, P2: np.ndarray) -> np.ndarray:
+    """Depth via Z = f*B/d; returns meters if baseline_m is meters."""
+    fx = float(P1[0, 0])
+    baseline_m = -float(P2[0, 3]) / fx  # meters when projection matrix is in pixels and translation in meters*fx
+    Z = np.zeros_like(disp, dtype=np.float32)
+    m = disp > 0
+    if baseline_m != 0:
+        Z[m] = (fx * baseline_m) / disp[m]
+    return Z
+
+
+def disp_to_vis(disp: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """8-bit and colorized disparity visualization."""
+    vis = np.zeros_like(disp, dtype=np.uint8)
+    m = disp > 0
+    if np.any(m):
+        v = disp[m]
+        lo, hi = np.percentile(v, 2), np.percentile(v, 98)
+        hi = max(hi, lo + 1e-6)
+        vis[m] = np.clip(255 * (disp[m] - lo) / (hi - lo), 0, 255).astype(np.uint8)
+    vis[~m] = 20
+    return vis, cv2.applyColorMap(vis, cv2.COLORMAP_JET)
+
+
+# ---------- Point Cloud Export ----------
+
+def save_point_cloud_from_disparity(rect_left_bgr: np.ndarray,
+                                    disparity: np.ndarray,
+                                    Q: np.ndarray,
+                                    out_ply_path: str,
+                                    calib_t_unit: str = "mm",
+                                    z_min: float = 50.0,
+                                    z_max: float = 5000.0) -> None:
+    """Build & save colored point cloud from disparity (PLY, meters)."""
+    pts3d = cv2.reprojectImageTo3D(disparity.astype(np.float32), Q)  # (H,W,3) in units of T
+    Z = pts3d[..., 2]
+
+    mask = (disparity > 0) & np.isfinite(pts3d).all(axis=2) & (Z > float(z_min)) & (Z < float(z_max))
+    if not np.any(mask):
+        raise RuntimeError("No valid 3D points after masking.")
+
+    pts = pts3d[mask].astype(np.float32)
+    if calib_t_unit.lower() == "mm":
+        pts *= 0.001  # convert mm → meters for PLY
+
+    # Colors: BGR → RGB, 0..1
+    cols_bgr = rect_left_bgr[mask].astype(np.float32) / 255.0
+    cols_rgb = cols_bgr[:, ::-1]
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(cols_rgb.astype(np.float64))
+
+    os.makedirs(os.path.dirname(out_ply_path) or ".", exist_ok=True)
+    ok = o3d.io.write_point_cloud(out_ply_path, pcd, write_ascii=True, print_progress=True)
+    if not ok:
+        raise IOError(f"Failed to save PLY: {out_ply_path}")
+    print(f"[OK] Point cloud saved -> {out_ply_path}  (points: {len(pts)})")
+
+
+# ---------- Main ----------
+
+def main() -> None:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    base = os.path.splitext(os.path.basename(IMAGE_PATH))[0]
+
+    # 1) Load & split SBS
+    left_bgr, right_bgr = split_sbs(IMAGE_PATH)
+
+    # 2) Load calibration, rectify with NO resize
+    calib = load_npz_calibration(CALIB_NPZ)
+    rectL, rectR, P1, P2, Q = rectify_no_resize(left_bgr, right_bgr, calib)
+
+    # 3) Disparity
+    disp = compute_disparity(rectL, rectR, num_disp=240, block_size=3, use_wls=USE_WLS)
+
+    # 4) Depth maps (two ways)
+    depth_mm_from_Q  = disparity_to_depth_Q(disp, Q)         # likely mm
+    depth_m_from_fxB = disparity_to_depth_fxB(disp, P1, P2)  # meters
+
+    # 5) Disparity visualization
+    disp_u8, disp_col = disp_to_vis(disp)
+
+    # 6) Save images & arrays
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base}_rect_left.png"), rectL)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base}_rect_right.png"), rectR)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base}_disparity_gray.png"), disp_u8)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base}_disparity_color.png"), disp_col)
+
+    np.save(os.path.join(OUTPUT_DIR, f"{base}_disp_float32.npy"), disp.astype(np.float32))
+    np.save(os.path.join(OUTPUT_DIR, f"{base}_depth_Q_mm.npy"),   depth_mm_from_Q.astype(np.float32))
+    np.save(os.path.join(OUTPUT_DIR, f"{base}_depth_fxB_m.npy"),  depth_m_from_fxB.astype(np.float32))
+
+    # 7) Also export a 16-bit depth PNG (millimeters from Q)
+    depth_mm16 = np.clip(depth_mm_from_Q, 0, 65535).astype(np.uint16)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base}_depth_Q_mm16.png"), depth_mm16)
+
+    # 8) Save intrinsics/extrinsics slices for reproducibility
+    np.save(os.path.join(OUTPUT_DIR, f"{base}_Q.npy"),  Q.astype(np.float64))
+    np.save(os.path.join(OUTPUT_DIR, f"{base}_P1.npy"), P1.astype(np.float64))
+    np.save(os.path.join(OUTPUT_DIR, f"{base}_P2.npy"), P2.astype(np.float64))
+
+    # 9) Colored point cloud (PLY) — output in meters
+    ply_out = os.path.join(OUTPUT_DIR, f"{base}_pointcloud_from_Q.ply")
+    z_min = PLY_Z_MIN
+    z_max = PLY_Z_MAX
+    save_point_cloud_from_disparity(rectL, disp, Q, ply_out,
+                                    calib_t_unit=CALIB_T_UNIT,
+                                    z_min=z_min, z_max=z_max)
+
+    # 10) Quick stats
+    valid = disp > 0
+    print(f"Valid disparity: {valid.sum()}/{disp.size} = {100*valid.mean():.2f}%")
+    if valid.any():
+        v = disp[valid]
+        print(f"d min/max p1/p99: {v.min():.2f}/{v.max():.2f}  {np.percentile(v,1):.2f}/{np.percentile(v,99):.2f}")
+        print(f"Depth median (Q, mm): {np.median(depth_mm_from_Q[valid]):.1f}")
+
+    print("[DONE] Depth maps and point cloud exported.")
+
+
+if __name__ == "__main__":
+    main()
