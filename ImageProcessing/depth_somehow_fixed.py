@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Depth + Colored Point Cloud from a side-by-side stereo image (NO RESIZING)
+SGBM/WLS tuned version with smoother looking results and auto L/R detection.
+
+What this does:
+- Tries both calibration orders (cam1=left, cam2=right) and the swapped order.
+- Picks the order that yields the highest coverage of positive disparities.
+- Three SGBM profiles: balanced, detail, lowtex.
+- Optional WLS smoothing (opencv-contrib ximgproc).
+- Gentle CLAHE and optional histogram matching to reduce radiometric mismatch.
+- Saves: rectified images, disparity (u8 + color), float disparity, depth (Q mm and fxB m),
+        Q/P1/P2, and a colored PLY in meters.
+
+Notes:
+- Do not enable negative disparity. The correct fix is using the calibration order that
+  produces positive disparity for points in front of the cameras.
+"""
+
+import os
+from typing import Tuple, Dict, Optional
+import numpy as np
+import cv2
+import open3d as o3d
+
+
+# ========== EDIT THESE ==========
+IMAGE_PATH = r"data/input_images/WIN_20250925_14_02_16_Pro.jpg"  # SBS image
+CALIB_NPZ  = r"opencv_stereo_params2.npz"                        # your npz
+OUTPUT_DIR = r"data/output/depth_only"
+
+# Choose disparity profile: "balanced" | "detail" | "lowtex"
+PROFILE   = "balanced"
+
+# Overall disparity search range (multiple of 16). 240–256 are good defaults.
+NUM_DISP  = 256
+
+# Use WLS (opencv-contrib ximgproc required)
+USE_WLS   = True
+
+# Preprocess toggles
+DO_HIST_MATCH = True     # match right->left histogram to reduce radiometric mismatch
+
+# Preview only smoothing of PNG (does not affect geometry or PLY)
+SMOOTH_PREVIEW = True
+
+# Calibration translation unit ("mm" or "m") — Q and PLY export respect this
+CALIB_T_UNIT = "mm"
+
+# PLY export Z gate in the same units as Q and T. Converted to meters if CALIB_T_UNIT == "mm"
+PLY_Z_MIN = 20.0
+PLY_Z_MAX = 20000.0
+# ===============================
+
+
+# ---------- Calibration / IO helpers ----------
+
+def load_npz_calibration(npz_path: str) -> Dict[str, np.ndarray]:
+    if not os.path.exists(npz_path):
+        raise FileNotFoundError(npz_path)
+    p = np.load(npz_path, allow_pickle=False)
+
+    K1 = np.array(p["camera_matrix_1"], dtype=np.float64)
+    D1 = np.array(p["dist_coeffs_1"], dtype=np.float64).reshape(-1, 1)
+    K2 = np.array(p["camera_matrix_2"], dtype=np.float64)
+    D2 = np.array(p["dist_coeffs_2"], dtype=np.float64).reshape(-1, 1)
+    R  = np.array(p["R"], dtype=np.float64)
+    T  = np.array(p["T"], dtype=np.float64).reshape(3, 1)
+
+    image_size = tuple(np.array(p["image_size"]).tolist())  # might be (H, W) or (W, H)
+    if image_size[0] < image_size[1]:
+        W, H = image_size[1], image_size[0]
+    else:
+        W, H = image_size
+
+    return dict(K1=K1, D1=D1, K2=K2, D2=D2, R=R, T=T, size=(W, H))
+
+
+def split_sbs(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read: {path}")
+    h, w = img.shape[:2]
+    if w % 2 != 0:
+        raise ValueError(f"Width must be even for SBS. Got {w}")
+    half = w // 2
+    return img[:, :half].copy(), img[:, half:].copy()
+
+
+def assert_halves_match_size(left_bgr: np.ndarray, right_bgr: np.ndarray, calib_size: Tuple[int, int]) -> None:
+    Wc, Hc = calib_size
+    Hl, Wl = left_bgr.shape[:2]
+    Hr, Wr = right_bgr.shape[:2]
+    if (Wl, Hl) != (Wc, Hc) or (Wr, Hr) != (Wc, Hc):
+        raise ValueError(
+            "Input halves size mismatch with calibration.\n"
+            f"  Left:  {(Wl, Hl)}\n"
+            f"  Right: {(Wr, Hr)}\n"
+            f"  Calib: {(Wc, Hc)}"
+        )
+
+
+# ---------- Profiles ----------
+
+def get_profile(name: str) -> Dict:
+    """
+    Returns a dict with SGBM + WLS + preprocess choices.
+    mode: SGBM_3WAY or HH
+    bs: blockSize
+    uniq: uniquenessRatio
+    p2_mult: coefficient for P2 (P2 = p2_mult * cn * bs^2)
+    disp12MaxDiff: small relax helps continuity
+    wls_lambda, wls_sigma: WLS smoothing strength
+    clahe_clip, clahe_tile: gentle equalization
+    """
+    name = (name or "balanced").lower()
+    if name == "detail":
+        return dict(
+            mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
+            bs=3, uniq=12, p2_mult=48, disp12MaxDiff=2,
+            wls_lambda=22000.0, wls_sigma=0.9,
+            clahe_clip=1.5, clahe_tile=(12, 12)
+        )
+    elif name == "lowtex":
+        return dict(
+            mode=cv2.STEREO_SGBM_MODE_HH,
+            bs=7, uniq=10, p2_mult=48, disp12MaxDiff=3,
+            wls_lambda=32000.0, wls_sigma=1.4,
+            clahe_clip=1.5, clahe_tile=(12, 12)
+        )
+    else:
+        return dict(
+            mode=cv2.STEREO_SGBM_MODE_HH,
+            bs=5, uniq=14, p2_mult=64, disp12MaxDiff=2,
+            wls_lambda=28000.0, wls_sigma=1.2,
+            clahe_clip=1.5, clahe_tile=(12, 12)
+        )
+
+
+# ---------- Rectification with auto L/R ----------
+
+def invert_extrinsics(R: np.ndarray, T: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    R_sw = R.T
+    T_sw = -R_sw @ T
+    return R_sw, T_sw
+
+
+def rectify_with_calib_order(left_bgr: np.ndarray, right_bgr: np.ndarray, calib: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
+        calib["K1"], calib["D1"], calib["K2"], calib["D2"],
+        calib["size"], calib["R"], calib["T"],
+        flags=cv2.CALIB_ZERO_DISPARITY, alpha=0
+    )
+    map1L, map2L = cv2.initUndistortRectifyMap(calib["K1"], calib["D1"], R1, P1, calib["size"], cv2.CV_16SC2)
+    map1R, map2R = cv2.initUndistortRectifyMap(calib["K2"], calib["D2"], R2, P2, calib["size"], cv2.CV_16SC2)
+    rectL = cv2.remap(left_bgr,  map1L, map2L, cv2.INTER_LINEAR)
+    rectR = cv2.remap(right_bgr, map1R, map2R, cv2.INTER_LINEAR)
+    return rectL, rectR, P1, P2, Q
+
+
+def rectify_with_swapped_order(left_bgr: np.ndarray, right_bgr: np.ndarray, calib: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    R_sw, T_sw = invert_extrinsics(calib["R"], calib["T"])
+    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
+        calib["K2"], calib["D2"], calib["K1"], calib["D1"],
+        calib["size"], R_sw, T_sw,
+        flags=cv2.CALIB_ZERO_DISPARITY, alpha=0
+    )
+    map1L, map2L = cv2.initUndistortRectifyMap(calib["K2"], calib["D2"], R1, P1, calib["size"], cv2.CV_16SC2)
+    map1R, map2R = cv2.initUndistortRectifyMap(calib["K1"], calib["D1"], R2, P2, calib["size"], cv2.CV_16SC2)
+    rectL = cv2.remap(left_bgr,  map1L, map2L, cv2.INTER_LINEAR)
+    rectR = cv2.remap(right_bgr, map1R, map2R, cv2.INTER_LINEAR)
+    return rectL, rectR, P1, P2, Q
+
+
+# ---------- Disparity / Depth ----------
+
+def build_sgbm(num_disp: int,
+               mode: int,
+               bs: int,
+               uniq: int,
+               p2_mult: int,
+               disp12MaxDiff: int) -> cv2.StereoSGBM:
+    nd = int(np.ceil(num_disp / 16.0)) * 16
+    bs = bs if bs % 2 == 1 else bs + 1
+    cn = 1  # grayscale
+    P1 = 8  * cn * bs * bs
+    P2 = p2_mult * cn * bs * bs
+    return cv2.StereoSGBM_create(
+        minDisparity=0,
+        numDisparities=nd,
+        blockSize=bs,
+        P1=P1,
+        P2=P2,
+        disp12MaxDiff=disp12MaxDiff,
+        uniquenessRatio=uniq,
+        speckleWindowSize=200,
+        speckleRange=2,
+        preFilterCap=31,
+        mode=mode
+    )
+
+
+def match_histogram_to(src_gray: np.ndarray, ref_gray: np.ndarray) -> np.ndarray:
+    src = src_gray.ravel()
+    ref = ref_gray.ravel()
+    s_values, bin_idx, s_counts = np.unique(src, return_inverse=True, return_counts=True)
+    r_values, r_counts = np.unique(ref, return_counts=True)
+    s_quant = np.cumsum(s_counts).astype(np.float64); s_quant /= s_quant[-1]
+    r_quant = np.cumsum(r_counts).astype(np.float64); r_quant /= r_quant[-1]
+    interp = np.interp(s_quant, r_quant, r_values)
+    return interp[bin_idx].reshape(src_gray.shape).astype(np.uint8)
+
+
+def compute_disparity(rectL_bgr: np.ndarray,
+                      rectR_bgr: np.ndarray,
+                      num_disp: int,
+                      prof: Dict,
+                      use_wls: bool) -> np.ndarray:
+    grayL = cv2.cvtColor(rectL_bgr, cv2.COLOR_BGR2GRAY)
+    grayR = cv2.cvtColor(rectR_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Light denoise
+    grayL = cv2.bilateralFilter(grayL, 9, 50, 50)
+    grayR = cv2.bilateralFilter(grayR, 9, 50, 50)
+
+    # Gentle CLAHE
+    clahe = cv2.createCLAHE(clipLimit=prof["clahe_clip"], tileGridSize=prof["clahe_tile"])
+    grayL = clahe.apply(grayL)
+    grayR = clahe.apply(grayR)
+
+    # Optional histogram match to tame exposure mismatch
+    if DO_HIST_MATCH:
+        grayR = match_histogram_to(grayR, grayL)
+
+    sgbm = build_sgbm(num_disp, prof["mode"], prof["bs"], prof["uniq"], prof["p2_mult"], prof["disp12MaxDiff"])
+    dispL16 = sgbm.compute(grayL, grayR)
+
+    if use_wls and hasattr(cv2, "ximgproc"):
+        right_matcher = cv2.ximgproc.createRightMatcher(sgbm)
+        dispR16 = right_matcher.compute(grayR, grayL)
+
+        wls = cv2.ximgproc.createDisparityWLSFilter(matcher_left=sgbm)
+        wls.setLambda(float(prof["wls_lambda"]))
+        wls.setSigmaColor(float(prof["wls_sigma"]))
+
+        disp = wls.filter(dispL16, rectL_bgr, disparity_map_right=dispR16).astype(np.float32) / 16.0
+    else:
+        disp = dispL16.astype(np.float32) / 16.0
+
+    # Speckle prune and clamp negatives
+    d16 = (disp * 16.0).astype(np.int16)
+    cv2.filterSpeckles(d16, 0, 0, 2 * 16)
+    disp = d16.astype(np.float32) / 16.0
+    disp[disp < 0] = 0.0
+
+    # Tiny median to soften steps
+    disp = cv2.medianBlur(disp, 3)
+
+    return disp
+
+
+def disparity_to_depth_Q(disp: np.ndarray, Q: np.ndarray) -> np.ndarray:
+    pts3d = cv2.reprojectImageTo3D(disp.astype(np.float32), Q)
+    Z = pts3d[..., 2].astype(np.float32)
+    Z[~np.isfinite(Z)] = 0.0
+    Z[disp <= 0] = 0.0
+    return Z
+
+
+def disparity_to_depth_fxB(disp: np.ndarray, P1: np.ndarray, P2: np.ndarray) -> np.ndarray:
+    fx = float(P1[0, 0])
+    baseline_m = -float(P2[0, 3]) / fx if fx != 0 else 0.0
+    Z = np.zeros_like(disp, dtype=np.float32)
+    m = (disp > 0) & np.isfinite(disp)
+    if baseline_m != 0:
+        Z[m] = (fx * baseline_m) / disp[m]
+    return Z
+
+
+def disp_to_vis(disp: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    vis = np.zeros_like(disp, dtype=np.uint8)
+    m = (disp > 0) & np.isfinite(disp)
+    if np.any(m):
+        v = disp[m].astype(np.float32)
+        lo, hi = np.percentile(v, 1.0), np.percentile(v, 99.0)
+        hi = max(hi, lo + 1e-6)
+        vis[m] = np.clip(255.0 * (disp[m] - lo) / (hi - lo), 0, 255).astype(np.uint8)
+        if SMOOTH_PREVIEW:
+            vis = cv2.GaussianBlur(vis, (3, 3), 0)
+    try:
+        col = cv2.applyColorMap(vis, cv2.COLORMAP_TURBO)
+    except Exception:
+        col = cv2.applyColorMap(vis, cv2.COLORMAP_JET)
+    return vis, col
+
+
+# ---------- Auto order selection ----------
+
+def valid_positive_ratio(disp: np.ndarray) -> float:
+    m = (disp > 0) & np.isfinite(disp)
+    return float(m.sum()) / float(disp.size)
+
+
+def auto_rectify_and_disparity(left_bgr: np.ndarray,
+                               right_bgr: np.ndarray,
+                               calib: Dict,
+                               num_disp: int,
+                               prof: Dict,
+                               use_wls: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
+    # As-is order
+    rectL1, rectR1, P1a, P2a, Qa = rectify_with_calib_order(left_bgr, right_bgr, calib)
+    disp1 = compute_disparity(rectL1, rectR1, num_disp, prof, use_wls)
+    r1 = valid_positive_ratio(disp1)
+
+    # Swapped order
+    rectL2, rectR2, P1b, P2b, Qb = rectify_with_swapped_order(left_bgr, right_bgr, calib)
+    disp2 = compute_disparity(rectL2, rectR2, num_disp, prof, use_wls)
+    r2 = valid_positive_ratio(disp2)
+
+    if r2 > r1 * 1.02:
+        return rectL2, rectR2, P1b, P2b, Qb, disp2, "RL"
+    else:
+        return rectL1, rectR1, P1a, P2a, Qa, disp1, "LR"
+
+
+# ---------- Point Cloud Export ----------
+
+def save_point_cloud_from_disparity(rect_left_bgr: np.ndarray,
+                                    disparity: np.ndarray,
+                                    Q: np.ndarray,
+                                    out_ply_path: str,
+                                    calib_t_unit: str = "mm",
+                                    z_min: float = 50.0,
+                                    z_max: float = 5000.0) -> None:
+    pts3d = cv2.reprojectImageTo3D(disparity.astype(np.float32), Q)
+    Z = pts3d[..., 2]
+    finite3d = np.isfinite(pts3d).all(axis=2)
+    disp_ok = disparity > 0
+
+    if not np.any(disp_ok):
+        raise RuntimeError("No positive disparities. Check rectification or texture or parameters.")
+
+    mask = disp_ok & finite3d & (Z > float(z_min)) & (Z < float(z_max))
+    if not np.any(mask):
+        mask = disp_ok & finite3d
+
+    pts = pts3d[mask].astype(np.float32)
+    cols_bgr = rect_left_bgr[mask].astype(np.float32) / 255.0
+    cols_rgb = cols_bgr[:, ::-1]
+
+    if calib_t_unit.lower() == "mm":
+        pts *= 0.001  # mm to m
+
+    os.makedirs(os.path.dirname(out_ply_path) or ".", exist_ok=True)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(cols_rgb.astype(np.float64))
+    ok = o3d.io.write_point_cloud(out_ply_path, pcd, write_ascii=True, print_progress=True)
+    if not ok:
+        raise IOError(f"Failed to save PLY: {out_ply_path}")
+    print(f"[OK] Point cloud saved -> {out_ply_path}  (points: {len(pts)})")
+
+
+# ---------- Main ----------
+
+def main() -> None:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    base = os.path.splitext(os.path.basename(IMAGE_PATH))[0]
+
+    # 1) Load and split SBS
+    left_bgr, right_bgr = split_sbs(IMAGE_PATH)
+
+    # 2) Load calibration and verify sizes
+    calib = load_npz_calibration(CALIB_NPZ)
+    assert_halves_match_size(left_bgr, right_bgr, calib["size"])
+
+    # 3) Build profile and run auto L/R rectification + disparity
+    prof = get_profile(PROFILE)
+    rectL, rectR, P1, P2, Q, disp, order_used = auto_rectify_and_disparity(
+        left_bgr, right_bgr, calib, NUM_DISP, prof, USE_WLS
+    )
+    print(f"[LR auto] Using order: {order_used} (positive disparity coverage chosen)")
+
+    # 4) Depth maps
+    depth_mm_from_Q  = disparity_to_depth_Q(disp, Q)        # likely mm if Q came from mm T
+    depth_m_from_fxB = disparity_to_depth_fxB(disp, P1, P2) # meters
+
+    # 5) Disparity visualization
+    disp_u8, disp_col = disp_to_vis(disp)
+
+    # 6) Save images and arrays
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base}_rect_left.png"), rectL)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base}_rect_right.png"), rectR)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base}_disparity_gray.png"), disp_u8)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base}_disparity_color.png"), disp_col)
+
+    np.save(os.path.join(OUTPUT_DIR, f"{base}_disp_float32.npy"), disp.astype(np.float32))
+    np.save(os.path.join(OUTPUT_DIR, f"{base}_depth_Q_mm.npy"),   depth_mm_from_Q.astype(np.float32))
+    np.save(os.path.join(OUTPUT_DIR, f"{base}_depth_fxB_m.npy"),  depth_m_from_fxB.astype(np.float32))
+
+    # 7) Export a 16 bit depth PNG (millimeters from Q)
+    depth_mm16 = np.clip(depth_mm_from_Q, 0, 65535).astype(np.uint16)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base}_depth_Q_mm16.png"), depth_mm16)
+
+    # 8) Save intrinsics and extrinsics slices
+    np.save(os.path.join(OUTPUT_DIR, f"{base}_Q.npy"),  Q.astype(np.float64))
+    np.save(os.path.join(OUTPUT_DIR, f"{base}_P1.npy"), P1.astype(np.float64))
+    np.save(os.path.join(OUTPUT_DIR, f"{base}_P2.npy"), P2.astype(np.float64))
+
+    # 9) Colored point cloud (PLY) — output in meters
+    ply_out = os.path.join(OUTPUT_DIR, f"{base}_pointcloud_from_Q.ply")
+    save_point_cloud_from_disparity(rectL, disp, Q, ply_out,
+                                    calib_t_unit=CALIB_T_UNIT,
+                                    z_min=PLY_Z_MIN, z_max=PLY_Z_MAX)
+
+    # 10) Quick stats
+    valid = (disp > 0) & np.isfinite(disp)
+    print(f"Valid disparity: {valid.sum()}/{disp.size} = {100.0*valid.mean():.2f}%")
+    if valid.any():
+        v = disp[valid]
+        print(f"d min/max p1/p99: {v.min():.2f}/{v.max():.2f}  {np.percentile(v,1):.2f}/{np.percentile(v,99):.2f}")
+        print(f"Depth median (Q, mm): {np.median(depth_mm_from_Q[valid]):.1f}")
+
+    print("[DONE] Depth maps and point cloud exported.")
+
+
+if __name__ == "__main__":
+    main()
