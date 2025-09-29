@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Pairwise merge with a fixed 90° RIGHT TURN for y_up point clouds.
+
+- Assumes both PLYs are already exported in the same frame (your depth exporter uses EXPORT_FRAME="y_up"):
+    X = right, Y = up, Z = forward
+- Keeps A fixed as the world.
+- Rotates B by -90° about the Y (up) axis ("turn right"), about a chosen pivot.
+- Then aligns centroids (optional but helpful).
+- No RANSAC; optional tiny ICP is off by default to preserve your exact turn.
+
+If your rig turns the OTHER way, set ROT_DEG = +90.0.
+"""
+
+import os, glob
+from typing import Optional, Tuple
+import numpy as np
+import open3d as o3d
+
+# =================== USER SETTINGS ===================
+INPUT_DIR   = r"data/output/ply_inputs"   # used if PLY_A/PLY_B not set
+OUTPUT_DIR  = r"data/output/registration_turn_right"
+
+# Explicit files (recommended)
+PLY_A = r"data/output/ply_inputs/WIN_20250929_09_22_09_Pro_pointcloud_from_Q.ply"  # FRONT (world)
+PLY_B = r"data/output/ply_inputs/WIN_20250929_09_22_25_Pro_pointcloud_from_Q.ply"  # RIGHT view
+
+# Coordinate frame of the PLYs (must match your exporter)
+INPUT_FRAME = "y_up"      # keep as "y_up" given your depth script
+
+# Turn to the RIGHT = -90° about the UP axis (Y for y_up)
+ROT_AXIS = "y"            # "x" | "y" | "z"  (with y_up, UP = "y")
+ROT_DEG  = -90.0          # +90 would be left turn; -90 is right turn
+
+# Rotate around:
+PIVOT_MODE   = "origin"  # "centroid_A" | "centroid_B" | "midcentroid" | "origin"
+ALIGN_CENTERS = True         # after rotation, translate B to match A's centroid
+
+# Optional finishing touches
+VOXEL_FOR_SAVE: Optional[float] = None   # e.g., 0.008 to lightly fuse duplicates
+RUN_TINY_ICP = False
+ICP_MAX_ITERS = 30
+ICP_MAX_DIST  = 0.01
+# =====================================================
+
+def ensure_dir(p): os.makedirs(p, exist_ok=True)
+
+def scan_two_plys(folder: str) -> Tuple[str, str]:
+    fs = sorted(glob.glob(os.path.join(folder, "*.ply")))
+    if len(fs) < 2:
+        raise FileNotFoundError(f"Need at least two .ply files in: {folder}")
+    if len(fs) > 2:
+        print(f"[warn] Found {len(fs)} PLYs; using first two after sort.")
+    return fs[0], fs[1]
+
+def load_pcd(path: str) -> o3d.geometry.PointCloud:
+    p = o3d.io.read_point_cloud(path)
+    if p.is_empty():
+        raise IOError(f"Empty/invalid PLY: {path}")
+    return p
+
+def centroid(pcd: o3d.geometry.PointCloud) -> np.ndarray:
+    return np.asarray(pcd.get_center(), dtype=np.float64)
+
+def rot_T(axis: str, deg: float, pivot: np.ndarray) -> np.ndarray:
+    axis = axis.lower()
+    th = np.deg2rad(deg)
+    c, s = np.cos(th), np.sin(th)
+    if axis == "x":
+        R = np.array([[1, 0, 0],[0, c,-s],[0, s, c]], dtype=np.float64)
+    elif axis == "y":
+        R = np.array([[ c, 0, s],[ 0, 1, 0],[-s, 0, c]], dtype=np.float64)
+    elif axis == "z":
+        R = np.array([[ c,-s, 0],[ s, c, 0],[ 0, 0, 1]], dtype=np.float64)
+    else:
+        raise ValueError("ROT_AXIS must be 'x', 'y', or 'z'")
+    T = np.eye(4, dtype=np.float64)
+    T[:3,:3] = R
+    # rotate about pivot: x' = R(x - p) + p = R x + (p - R p)
+    T[:3,3] = pivot - R @ pivot
+    return T
+
+def choose_pivot(mode: str, A: o3d.geometry.PointCloud, B: o3d.geometry.PointCloud) -> np.ndarray:
+    cA = centroid(A); cB = centroid(B)
+    m = mode.lower()
+    if m == "centroid_a": return cA
+    if m == "centroid_b": return cB
+    if m == "origin":     return np.zeros(3, dtype=np.float64)
+    return 0.5 * (cA + cB)  # "midcentroid"
+
+def run():
+    ensure_dir(OUTPUT_DIR)
+
+    if PLY_A and PLY_B:
+        fA, fB = PLY_A, PLY_B
+    else:
+        fA, fB = scan_two_plys(INPUT_DIR)
+
+    print(f"[in] A (world): {fA}")
+    print(f"[in] B (turn right by 90°): {fB}")
+    if INPUT_FRAME.lower() != "y_up":
+        print(f"[note] INPUT_FRAME={INPUT_FRAME} (script assumes y_up for 'turn right' = -90° about +Y).")
+
+    # Load point clouds
+    A = load_pcd(fA)
+    B = load_pcd(fB)
+
+    # 1) Rotate B by -90° around UP axis (Y) about chosen pivot
+    pivot = choose_pivot(PIVOT_MODE, A, B)
+    T_r = rot_T(ROT_AXIS, ROT_DEG, pivot)
+    B_rot = B.transform(T_r.copy())
+
+    # 2) Optional: align centroids after rotation (keeps rotation exact)
+    if ALIGN_CENTERS:
+        cA = centroid(A)
+        cB_rot = centroid(B_rot)
+        t = cA - cB_rot
+        T_t = np.eye(4, dtype=np.float64); T_t[:3,3] = t
+        B_aligned = B_rot.transform(T_t.copy())
+        T_final = T_t @ T_r
+        print(f"[align] centroid shift t = {t}")
+    else:
+        B_aligned = B_rot
+        T_final = T_r
+
+    print(f"[turn] axis={ROT_AXIS.upper()}, deg={ROT_DEG:.1f}, pivot={pivot}")
+    print("[T_final]\n", np.array_str(T_final, precision=6, suppress_small=True))
+
+    # 3) Optional very small ICP (polish only; OFF by default)
+    if RUN_TINY_ICP:
+        print("[icp] tiny ICP refine (may change placement slightly).")
+        A.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.03, max_nn=50))
+        B_aligned.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.03, max_nn=50))
+        icp = o3d.pipelines.registration.registration_icp(
+            B_aligned, A, ICP_MAX_DIST, np.eye(4),
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=ICP_MAX_ITERS)
+        )
+        T_final = icp.transformation @ T_final
+        B_aligned = B_aligned.transform(icp.transformation)
+        print(f"[icp] fitness={icp.fitness:.3f}, rmse={icp.inlier_rmse:.4f}")
+
+    # 4) Merge & save
+    merged = A + B_aligned
+    if VOXEL_FOR_SAVE: merged = merged.voxel_down_sample(VOXEL_FOR_SAVE)
+
+    baseA = os.path.splitext(os.path.basename(fA))[0]
+    baseB = os.path.splitext(os.path.basename(fB))[0]
+    out_A   = os.path.join(OUTPUT_DIR, f"{baseA}_world.ply")
+    out_B   = os.path.join(OUTPUT_DIR, f"{baseB}_turnedRight_aligned.ply")
+    out_M   = os.path.join(OUTPUT_DIR, f"{baseA}__plus__{baseB}_merged_turnedRight.ply")
+    out_Tnp = os.path.join(OUTPUT_DIR, f"T_{baseB}_to_{baseA}_turnedRight.npy")
+    out_Ttx = os.path.join(OUTPUT_DIR, f"T_{baseB}_to_{baseA}_turnedRight.txt")
+
+    o3d.io.write_point_cloud(out_A, A, write_ascii=True)
+    o3d.io.write_point_cloud(out_B, B_aligned, write_ascii=True)
+    o3d.io.write_point_cloud(out_M, merged, write_ascii=True)
+    np.save(out_Tnp, T_final); np.savetxt(out_Ttx, T_final, fmt="%.8f")
+
+    print(f"[ok] Saved:\n  {out_A}\n  {out_B}\n  {out_M}\n  {out_Tnp}\n  {out_Ttx}")
+
+if __name__ == "__main__":
+    run()
